@@ -164,14 +164,31 @@ def status_text(item):
 
 
 async def seerr_search(query: str, media_type: str):
-    # Seerr 3.4.x refuse les espaces encodÃ©s en "+" dans le paramÃ¨tre query.
-    # On force donc un encodage RFC 3986 avec %20.
+    # IMPORTANT:
+    # httpx encode normalement les paramÃ¨tres de formulaire avec "+" pour les espaces.
+    # Seerr 3.4.x refuse ce format. On construit donc ici la query brute avec %20.
     encoded_query = quote(query, safe="")
-    data = await api_get(
-        SEERR_URL,
-        f"/api/v1/search?query={encoded_query}&page=1",
-        SEERR_API_KEY,
+    base = httpx.URL(f"{SEERR_URL}/api/v1/search")
+    url = base.copy_with(
+        query=f"query={encoded_query}&page=1".encode("ascii")
     )
+
+    headers = {"X-Api-Key": SEERR_API_KEY}
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(url, headers=headers)
+
+        if r.status_code >= 400:
+            log.error(
+                "Seerr search error HTTP %s | URL=%s | BODY=%s",
+                r.status_code,
+                r.url,
+                r.text[:1000],
+            )
+
+        r.raise_for_status()
+        data = r.json()
+
     results = data.get("results", data if isinstance(data, list) else [])
     return [x for x in results if x.get("mediaType") == media_type][:5]
 
