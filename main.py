@@ -4,6 +4,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -163,7 +164,14 @@ def status_text(item):
 
 
 async def seerr_search(query: str, media_type: str):
-    data = await api_get(SEERR_URL, "/api/v1/search", SEERR_API_KEY, {"query": query, "page": 1})
+    # Seerr 3.4.x refuse les espaces encodÃ©s en "+" dans le paramÃ¨tre query.
+    # On force donc un encodage RFC 3986 avec %20.
+    encoded_query = quote(query, safe="")
+    data = await api_get(
+        SEERR_URL,
+        f"/api/v1/search?query={encoded_query}&page=1",
+        SEERR_API_KEY,
+    )
     results = data.get("results", data if isinstance(data, list) else [])
     return [x for x in results if x.get("mediaType") == media_type][:5]
 
