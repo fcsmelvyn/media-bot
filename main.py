@@ -1,6 +1,9 @@
 import asyncio
 import json
 import logging
+import html
+import re
+import time
 import os
 from pathlib import Path
 from typing import Optional
@@ -17,6 +20,7 @@ log = logging.getLogger("telegram-media-bot")
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 ALLOWED_USER_IDS_RAW = os.getenv("ALLOWED_USER_IDS", "").strip()
+ADMIN_USER_IDS_RAW = os.getenv("ADMIN_USER_IDS", "").strip()
 
 RADARR_URL = os.getenv("RADARR_URL", "").rstrip("/")
 RADARR_API_KEY = os.getenv("RADARR_API_KEY", "")
@@ -34,6 +38,8 @@ DATA_DIR = Path("/data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TOPICS_FILE = DATA_DIR / "topics.json"
 STATE_FILE = DATA_DIR / "state.json"
+USERS_FILE = DATA_DIR / "users.json"
+REQUESTS_FILE = DATA_DIR / "requests.json"
 TMDB_POSTER_BASE = "https://image.tmdb.org/t/p/w500"
 
 
@@ -50,6 +56,7 @@ def parse_ids(raw: str) -> set[int]:
 
 
 ALLOWED_USER_IDS = parse_ids(ALLOWED_USER_IDS_RAW)
+ADMIN_USER_IDS = parse_ids(ADMIN_USER_IDS_RAW)
 
 
 def load_json(path: Path, default):
@@ -67,6 +74,20 @@ def save_json(path: Path, data):
 
 topics = load_json(TOPICS_FILE, {})
 state = load_json(STATE_FILE, {"initialized": False, "radarr_seen": [], "sonarr_seen": []})
+users = load_json(USERS_FILE, {})
+requests_db = load_json(REQUESTS_FILE, [])
+
+
+def is_admin_user_id(user_id: int) -> bool:
+    return user_id in ADMIN_USER_IDS
+
+
+def is_allowed_user_id(user_id: int) -> bool:
+    if is_admin_user_id(user_id):
+        return True
+    if user_id in ALLOWED_USER_IDS:
+        return True
+    return str(user_id) in users
 
 
 def is_allowed(update: Update) -> bool:
@@ -74,15 +95,32 @@ def is_allowed(update: Update) -> bool:
     chat = update.effective_chat
     if not user or not chat:
         return False
-    if TELEGRAM_CHAT_ID:
+
+    # Le bot n'accepte que le groupe Media Server ou les conversations privÃ©es.
+    if chat.type != "private" and TELEGRAM_CHAT_ID:
         try:
             if chat.id != int(TELEGRAM_CHAT_ID):
                 return False
         except ValueError:
-            pass
-    if ALLOWED_USER_IDS and user.id not in ALLOWED_USER_IDS:
-        return False
-    return True
+            return False
+
+    return is_allowed_user_id(user.id)
+
+
+def save_user(user_id: int, first_name="", username="", source="manual"):
+    users[str(user_id)] = {
+        "user_id": user_id,
+        "first_name": first_name or "",
+        "username": username or "",
+        "source": source,
+        "updated_at": int(time.time()),
+    }
+    save_json(USERS_FILE, users)
+
+
+def remove_user(user_id: int):
+    users.pop(str(user_id), None)
+    save_json(USERS_FILE, users)
 
 
 async def deny(update: Update):
@@ -235,15 +273,286 @@ async def seerr_request(media_type: str, media_id: int, seasons=None):
     return await api_post(SEERR_URL, "/api/v1/request", SEERR_API_KEY, payload)
 
 
+def normalize_title(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def title_from_callback_message(message) -> str:
+    raw = (getattr(message, "caption", None) or getattr(message, "text", None) or "").strip()
+    if not raw:
+        return ""
+    lines = [x.strip() for x in raw.splitlines() if x.strip()]
+    if not lines:
+        return ""
+    if lines[0].startswith(("ð¬ Film", "ðº SÃ©rie")) and len(lines) > 1:
+        title = lines[1]
+    else:
+        title = lines[0]
+    return re.sub(r"\s+\(\d{4}|\?\)$", "", title).strip()
+
+
+async def record_private_request(update: Update, media_type: str, media_id: int, seasons=None):
+    user = update.effective_user
+    message = update.callback_query.message if update.callback_query else update.effective_message
+    if not user:
+        return
+
+    title = title_from_callback_message(message)
+    tvdb_id = None
+
+    if media_type == "tv":
+        try:
+            details = await seerr_tv_details(media_id)
+            external = details.get("externalIds") or {}
+            tvdb_id = external.get("tvdbId") or details.get("tvdbId")
+            if not title:
+                title = details.get("name") or details.get("title") or ""
+        except Exception:
+            log.exception("Impossible de rÃ©cupÃ©rer le TVDB ID pour la demande")
+
+    entry = {
+        "user_id": user.id,
+        "first_name": user.first_name or "",
+        "media_type": media_type,
+        "media_id": int(media_id),
+        "tvdb_id": int(tvdb_id) if str(tvdb_id).isdigit() else None,
+        "title": title,
+        "seasons": seasons,
+        "created_at": int(time.time()),
+        "notified": False,
+    }
+
+    # Evite les doublons stricts.
+    for old in requests_db:
+        if (
+            old.get("user_id") == entry["user_id"]
+            and old.get("media_type") == media_type
+            and old.get("media_id") == entry["media_id"]
+            and old.get("seasons") == seasons
+            and not old.get("notified")
+        ):
+            return
+
+    requests_db.append(entry)
+    save_json(REQUESTS_FILE, requests_db)
+
+
+async def notify_private_requests(app: Application, media_type: str, item: dict, poster="", extra=""):
+    changed = False
+    item_title = item.get("title") or ""
+    item_norm = normalize_title(item_title)
+    item_tmdb = item.get("tmdbId")
+    item_tvdb = item.get("tvdbId")
+
+    for req in requests_db:
+        if req.get("notified") or req.get("media_type") != media_type:
+            continue
+
+        match = False
+        if media_type == "movie":
+            if item_tmdb and int(item_tmdb) == int(req.get("media_id", -1)):
+                match = True
+        else:
+            if item_tvdb and req.get("tvdb_id") and int(item_tvdb) == int(req.get("tvdb_id")):
+                match = True
+
+        if not match and item_norm and normalize_title(req.get("title", "")) == item_norm:
+            match = True
+
+        if not match:
+            continue
+
+        kind = "ð¬ Votre film est disponible !" if media_type == "movie" else "ðº Votre sÃ©rie est disponible !"
+        caption = f"{kind}\n\n<b>{html.escape(item_title or req.get('title') or 'Contenu')}</b>"
+        if extra:
+            caption += f"\n{html.escape(extra)}"
+        if JELLYFIN_PUBLIC_URL:
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("â¶ï¸ Ouvrir Jellyfin", url=JELLYFIN_PUBLIC_URL)
+            ]])
+        else:
+            keyboard = None
+
+        try:
+            if poster:
+                await app.bot.send_photo(
+                    chat_id=int(req["user_id"]),
+                    photo=poster,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+            else:
+                await app.bot.send_message(
+                    chat_id=int(req["user_id"]),
+                    text=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+            req["notified"] = True
+            req["notified_at"] = int(time.time())
+            changed = True
+        except Exception:
+            # Telegram interdit au bot d'initier un MP si la personne n'a jamais dÃ©marrÃ© le bot.
+            log.exception("Notification privÃ©e impossible pour user_id=%s", req.get("user_id"))
+
+    if changed:
+        save_json(REQUESTS_FILE, requests_db)
+
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not update.effective_message:
+        return
+    await update.effective_message.reply_text(
+        f"ð Ton User ID Telegram : <code>{user.id}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def allow_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin_user_id(user.id):
+        return await deny(update)
+
+    if not context.args:
+        return await update.effective_message.reply_text("Utilisation : /allow USER_ID PrÃ©nom")
+
+    try:
+        user_id = int(context.args[0])
+    except ValueError:
+        return await update.effective_message.reply_text("â USER_ID invalide.")
+
+    name = " ".join(context.args[1:]).strip()
+    save_user(user_id, first_name=name, source="admin")
+    await update.effective_message.reply_text(f"â Utilisateur {user_id} autorisÃ©.")
+
+
+async def remove_allowed_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin_user_id(user.id):
+        return await deny(update)
+
+    if not context.args:
+        return await update.effective_message.reply_text("Utilisation : /removeuser USER_ID")
+
+    try:
+        user_id = int(context.args[0])
+    except ValueError:
+        return await update.effective_message.reply_text("â USER_ID invalide.")
+
+    if is_admin_user_id(user_id):
+        return await update.effective_message.reply_text("â ï¸ Un administrateur dÃ©fini dans ADMIN_USER_IDS ne peut pas Ãªtre retirÃ© ici.")
+
+    remove_user(user_id)
+    await update.effective_message.reply_text(f"â Utilisateur {user_id} retirÃ©.")
+
+
+async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin_user_id(user.id):
+        return await deny(update)
+
+    lines = ["ð¥ <b>Utilisateurs autorisÃ©s</b>", ""]
+    for uid in sorted(ADMIN_USER_IDS):
+        lines.append(f"ð <code>{uid}</code> â administrateur")
+    for uid, info in sorted(users.items(), key=lambda x: x[1].get("first_name", "")):
+        name = html.escape(info.get("first_name") or info.get("username") or "Sans nom")
+        lines.append(f"ð¤ {name} â <code>{uid}</code>")
+    for uid in sorted(ALLOWED_USER_IDS):
+        if uid not in ADMIN_USER_IDS and str(uid) not in users:
+            lines.append(f"ð¤ <code>{uid}</code> â variable Coolify")
+
+    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return
+    if TELEGRAM_CHAT_ID and chat.id != int(TELEGRAM_CHAT_ID):
+        return
+
+    me = await context.bot.get_me()
+    bot_url = f"https://t.me/{me.username}?start=media"
+
+    for member in msg.new_chat_members or []:
+        if member.is_bot:
+            continue
+
+        # Un membre qui rejoint le groupe est automatiquement autorisÃ© Ã  utiliser le bot en MP.
+        save_user(
+            member.id,
+            first_name=member.first_name or "",
+            username=member.username or "",
+            source="group_join",
+        )
+
+        name = html.escape(member.first_name or "Bienvenue")
+        welcome = (
+            f"ð <b>Bienvenue {name} !</b>\n\n"
+            "ð¬ Les nouveaux films disponibles sont publiÃ©s dans <b>Films</b>.\n"
+            "ðº Les nouvelles sÃ©ries/Ã©pisodes disponibles sont publiÃ©s dans <b>SÃ©ries</b>.\n\n"
+            "ð Pour faire une demande sans que les autres membres la voient, utilise le bot en <b>message privÃ©</b>."
+        )
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("ð¤ Faire une demande en privÃ©", url=bot_url)
+        ]])
+
+        thread_id = find_topic_id("Bienvenue", "Welcome")
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                message_thread_id=thread_id,
+                text=welcome,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+        except Exception:
+            log.exception("Impossible d'envoyer le message de bienvenue")
+
+
+async def remove_member_on_leave(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or not msg.left_chat_member:
+        return
+    member = msg.left_chat_member
+    if member.is_bot or is_admin_user_id(member.id):
+        return
+    remove_user(member.id)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return await deny(update)
+
     await remember_topic(update)
-    await update.effective_message.reply_text(
-        "ð  <b>Media Server Bot</b>\n\n"
-        "/film Dune\n/serie Breaking Bad\n/status\n/setup\n/topicid Nom\n/topics",
-        parse_mode=ParseMode.HTML,
-    )
+    chat = update.effective_chat
+    msg = update.effective_message
+
+    if chat and chat.type == "private":
+        await msg.reply_text(
+            "ð  <b>Media Server</b>\n\n"
+            "ð Cette conversation est privÃ©e. Les autres membres du groupe ne voient pas tes recherches ni tes demandes.\n\n"
+            "Ãcris simplement le nom d'un film ou d'une sÃ©rie, par exemple :\n"
+            "<code>Dune</code>\n"
+            "<code>Breaking Bad</code>\n\n"
+            "Je te prÃ©viendrai ici lorsque ton contenu sera disponible sur Jellyfin.",
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        me = await context.bot.get_me()
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "ð¤ Ouvrir le bot en privÃ©",
+                url=f"https://t.me/{me.username}?start=media"
+            )
+        ]])
+        await msg.reply_text(
+            "ð Les demandes de films et sÃ©ries se font maintenant en message privÃ© avec le bot.",
+            reply_markup=markup,
+        )
 
 
 async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -444,7 +753,7 @@ async def send_mixed_result(message, item: dict):
 
 
 async def natural_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Dans le topic Demande, un simple titre lance une recherche film + sÃ©rie."""
+    """En MP, un simple titre lance une recherche film + sÃ©rie."""
     if not is_allowed(update):
         return
 
@@ -452,10 +761,8 @@ async def natural_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.text:
         return
 
-    await remember_topic(update)
-
-    demande_id = find_topic_id("Demande", "Demandes")
-    if msg.message_thread_id != demande_id:
+    # Aucune recherche publique dans le groupe : confidentialitÃ© des demandes.
+    if not update.effective_chat or update.effective_chat.type != "private":
         return
 
     query = msg.text.strip()
@@ -581,6 +888,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             season = int(season_raw)
 
             await seerr_request("tv", media_id, [season])
+            await record_private_request(update, "tv", media_id, [season])
 
             await q.edit_message_reply_markup(
                 reply_markup=InlineKeyboardMarkup([[
@@ -605,6 +913,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             media_id = int(q.data.split(":", 1)[1])
 
             await seerr_request("tv", media_id, "all")
+            await record_private_request(update, "tv", media_id, "all")
 
             await q.edit_message_reply_markup(
                 reply_markup=InlineKeyboardMarkup([[
@@ -634,6 +943,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             media_id = int(media_id_raw)
             await seerr_request(media_type, media_id)
+            await record_private_request(update, media_type, media_id)
 
             await q.edit_message_reply_markup(
                 reply_markup=InlineKeyboardMarkup([[
@@ -686,6 +996,7 @@ async def monitor_imports(app: Application):
                     movie_id = r.get("movieId")
                     title = f"Film #{movie_id}"
                     poster = ""
+                    movie = {"title": title}
                     try:
                         movie = await api_get(RADARR_URL, f"/api/v3/movie/{movie_id}", RADARR_API_KEY)
                         title = movie.get("title", title)
@@ -697,6 +1008,13 @@ async def monitor_imports(app: Application):
                     sent = await send_photo_to_topic(app, ("Films", "Film"), poster, caption)
                     if not sent:
                         await send_to_topic(app, ("Films", "Film"), caption)
+                    try:
+                        await notify_private_requests(
+                            app, "movie", movie,
+                            poster=poster
+                        )
+                    except Exception:
+                        log.exception("Erreur notification privÃ©e film")
 
                 for r in reversed(sonarr):
                     if str(r.get("id")) in sseen:
@@ -704,6 +1022,7 @@ async def monitor_imports(app: Application):
                     series_id = r.get("seriesId")
                     title = f"SÃ©rie #{series_id}"
                     poster = ""
+                    show = {"title": title}
                     try:
                         show = await api_get(SONARR_URL, f"/api/v3/series/{series_id}", SONARR_API_KEY)
                         title = show.get("title", title)
@@ -716,6 +1035,14 @@ async def monitor_imports(app: Application):
                     sent = await send_photo_to_topic(app, ("SÃ©rie", "SÃ©ries", "Serie", "Series"), poster, caption)
                     if not sent:
                         await send_to_topic(app, ("SÃ©rie", "SÃ©ries", "Serie", "Series"), caption)
+                    try:
+                        await notify_private_requests(
+                            app, "tv", show,
+                            poster=poster,
+                            extra=source
+                        )
+                    except Exception:
+                        log.exception("Erreur notification privÃ©e sÃ©rie")
 
                 state["radarr_seen"] = rid[:100]
                 state["sonarr_seen"] = sid[:150]
@@ -736,8 +1063,12 @@ async def post_init(app: Application):
 
 def main():
     app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("allow", allow_user))
+    app.add_handler(CommandHandler("removeuser", remove_allowed_user))
+    app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CommandHandler("setup", setup))
     app.add_handler(CommandHandler("topicid", topicid))
     app.add_handler(CommandHandler("topics", topics_cmd))
@@ -745,9 +1076,11 @@ def main():
     app.add_handler(CommandHandler("film", film))
     app.add_handler(CommandHandler("serie", serie))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members), group=-1)
+    app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, remove_member_on_leave), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_request), group=0)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, passive_topic_capture), group=1)
-    log.info("DÃ©marrage Telegram Media Bot v4")
+    log.info("DÃ©marrage Telegram Media Bot v5")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
