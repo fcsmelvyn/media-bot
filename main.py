@@ -136,6 +136,36 @@ async def send_to_topic(app: Application, topic_names, text: str):
     )
 
 
+async def send_photo_to_topic(app: Application, topic_names, photo: str, caption: str):
+    if not TELEGRAM_CHAT_ID:
+        return False
+    thread_id = find_topic_id(*topic_names)
+    if not thread_id or not photo:
+        return False
+    try:
+        await app.bot.send_photo(
+            chat_id=int(TELEGRAM_CHAT_ID),
+            message_thread_id=thread_id,
+            photo=photo,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+    except Exception:
+        log.exception("Impossible d'envoyer la jaquette Telegram")
+        return False
+
+
+def arr_poster(item: dict) -> str:
+    poster = item.get("remotePoster")
+    if poster:
+        return poster
+    for image in item.get("images", []) or []:
+        if image.get("coverType") == "poster":
+            return image.get("remoteUrl") or image.get("url") or ""
+    return ""
+
+
 async def api_get(url, path, api_key="", params=None, timeout=10.0):
     headers = {"X-Api-Key": api_key} if api_key else {}
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -348,6 +378,128 @@ async def search_media(update: Update, context: ContextTypes.DEFAULT_TYPE, media
         await update.effective_message.reply_text(f"ð´ Erreur Seerr : {type(e).__name__}")
 
 
+async def send_mixed_result(message, item: dict):
+    media_type = item.get("mediaType")
+    if media_type not in {"movie", "tv"}:
+        return
+
+    media_id = item.get("id")
+    title = item.get("title") or item.get("name") or "Sans titre"
+    date = item.get("releaseDate") or item.get("firstAirDate") or ""
+    year = date[:4] if date else "?"
+    overview = (item.get("overview") or "").strip()
+    if len(overview) > 320:
+        overview = overview[:317] + "..."
+
+    s = (item.get("mediaInfo") or {}).get("status")
+    rows = []
+
+    if s == 5:
+        if JELLYFIN_PUBLIC_URL:
+            rows.append([InlineKeyboardButton("â¶ï¸ Ouvrir Jellyfin", url=JELLYFIN_PUBLIC_URL)])
+        else:
+            rows.append([InlineKeyboardButton("â DÃ©jÃ  disponible", callback_data="noop")])
+    elif s in {2, 3, 4}:
+        rows.append([InlineKeyboardButton("ð DÃ©jÃ  demandÃ©", callback_data="noop")])
+    elif media_type == "tv":
+        rows.append([
+            InlineKeyboardButton(
+                "ðº Choisir les saisons",
+                callback_data=f"tvseasons:{media_id}"
+            )
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton(
+                "ð¬ Demander le film",
+                callback_data=f"request:movie:{media_id}"
+            )
+        ])
+
+    kind = "ð¬ Film" if media_type == "movie" else "ðº SÃ©rie"
+    caption = f"{kind}\n<b>{title}</b> ({year})\n{status_text(item)}"
+    if overview:
+        caption += f"\n\n{overview}"
+
+    markup = InlineKeyboardMarkup(rows)
+    poster = item.get("posterPath")
+
+    if poster:
+        try:
+            await message.reply_photo(
+                photo=f"{TMDB_POSTER_BASE}{poster}",
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+            return
+        except Exception:
+            pass
+
+    await message.reply_text(
+        caption,
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup,
+    )
+
+
+async def natural_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dans le topic Demande, un simple titre lance une recherche film + sÃ©rie."""
+    if not is_allowed(update):
+        return
+
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+
+    await remember_topic(update)
+
+    demande_id = find_topic_id("Demande", "Demandes")
+    if msg.message_thread_id != demande_id:
+        return
+
+    query = msg.text.strip()
+    if len(query) < 2:
+        return
+
+    try:
+        encoded_query = quote(query, safe="")
+        base = httpx.URL(f"{SEERR_URL}/api/v1/search")
+        url = base.copy_with(
+            query=f"query={encoded_query}&page=1".encode("ascii")
+        )
+        headers = {"X-Api-Key": SEERR_API_KEY}
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(url, headers=headers)
+            if r.status_code >= 400:
+                log.error(
+                    "Seerr natural search HTTP %s | URL=%s | BODY=%s",
+                    r.status_code, r.url, r.text[:1000]
+                )
+            r.raise_for_status()
+            data = r.json()
+
+        results = data.get("results", data if isinstance(data, list) else [])
+        results = [x for x in results if x.get("mediaType") in {"movie", "tv"}][:6]
+
+        if not results:
+            await msg.reply_text("â Aucun film ou sÃ©rie trouvÃ©.")
+            return
+
+        await msg.reply_text(
+            f"ð RÃ©sultats pour <b>{query}</b> :",
+            parse_mode=ParseMode.HTML
+        )
+
+        for item in results:
+            await send_mixed_result(msg, item)
+
+    except Exception as e:
+        log.exception("Erreur recherche naturelle Seerr")
+        await msg.reply_text(f"ð´ Erreur Seerr : {type(e).__name__}")
+
+
 async def film(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await search_media(update, context, "movie")
 
@@ -533,27 +685,37 @@ async def monitor_imports(app: Application):
                         continue
                     movie_id = r.get("movieId")
                     title = f"Film #{movie_id}"
+                    poster = ""
                     try:
                         movie = await api_get(RADARR_URL, f"/api/v3/movie/{movie_id}", RADARR_API_KEY)
                         title = movie.get("title", title)
+                        poster = arr_poster(movie)
                     except Exception:
                         pass
                     quality = (((r.get("quality") or {}).get("quality") or {}).get("name") or "QualitÃ© inconnue")
-                    await send_to_topic(app, ("Films", "Film"), f"ð¬ <b>Nouveau film disponible !</b>\n\n<b>{title}</b>\nðï¸ {quality}\n\nâ¶ï¸ Disponible prochainement dans Jellyfin.")
+                    caption = f"ð¬ <b>Nouveau film disponible !</b>\n\n<b>{title}</b>\nðï¸ {quality}\n\nâ¶ï¸ Disponible prochainement dans Jellyfin."
+                    sent = await send_photo_to_topic(app, ("Films", "Film"), poster, caption)
+                    if not sent:
+                        await send_to_topic(app, ("Films", "Film"), caption)
 
                 for r in reversed(sonarr):
                     if str(r.get("id")) in sseen:
                         continue
                     series_id = r.get("seriesId")
                     title = f"SÃ©rie #{series_id}"
+                    poster = ""
                     try:
                         show = await api_get(SONARR_URL, f"/api/v3/series/{series_id}", SONARR_API_KEY)
                         title = show.get("title", title)
+                        poster = arr_poster(show)
                     except Exception:
                         pass
                     source = (r.get("data") or {}).get("sourceTitle") or "Nouvel Ã©pisode"
                     quality = (((r.get("quality") or {}).get("quality") or {}).get("name") or "QualitÃ© inconnue")
-                    await send_to_topic(app, ("SÃ©rie", "SÃ©ries", "Serie", "Series"), f"ðº <b>Nouvel Ã©pisode disponible !</b>\n\n<b>{title}</b>\n{source}\nðï¸ {quality}\n\nâ¶ï¸ Disponible prochainement dans Jellyfin.")
+                    caption = f"ðº <b>Nouvel Ã©pisode disponible !</b>\n\n<b>{title}</b>\n{source}\nðï¸ {quality}\n\nâ¶ï¸ Disponible prochainement dans Jellyfin."
+                    sent = await send_photo_to_topic(app, ("SÃ©rie", "SÃ©ries", "Serie", "Series"), poster, caption)
+                    if not sent:
+                        await send_to_topic(app, ("SÃ©rie", "SÃ©ries", "Serie", "Series"), caption)
 
                 state["radarr_seen"] = rid[:100]
                 state["sonarr_seen"] = sid[:150]
@@ -583,8 +745,9 @@ def main():
     app.add_handler(CommandHandler("film", film))
     app.add_handler(CommandHandler("serie", serie))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, passive_topic_capture))
-    log.info("DÃ©marrage Telegram Media Bot v2")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_request), group=0)
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, passive_topic_capture), group=1)
+    log.info("DÃ©marrage Telegram Media Bot v4")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
