@@ -25,6 +25,7 @@ SONARR_API_KEY = os.getenv("SONARR_API_KEY", "")
 SEERR_URL = os.getenv("SEERR_URL", "").rstrip("/")
 SEERR_API_KEY = os.getenv("SEERR_API_KEY", "")
 JELLYFIN_URL = os.getenv("JELLYFIN_URL", "").rstrip("/")
+JELLYFIN_PUBLIC_URL = os.getenv("JELLYFIN_PUBLIC_URL", "").rstrip("/")
 JELLYFIN_API_KEY = os.getenv("JELLYFIN_API_KEY", "")
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
@@ -193,10 +194,14 @@ async def seerr_search(query: str, media_type: str):
     return [x for x in results if x.get("mediaType") == media_type][:5]
 
 
-async def seerr_request(media_type: str, media_id: int):
+async def seerr_tv_details(media_id: int):
+    return await api_get(SEERR_URL, f"/api/v1/tv/{media_id}", SEERR_API_KEY)
+
+
+async def seerr_request(media_type: str, media_id: int, seasons=None):
     payload = {"mediaType": media_type, "mediaId": media_id}
     if media_type == "tv":
-        payload["seasons"] = "all"
+        payload["seasons"] = seasons if seasons is not None else "all"
     return await api_post(SEERR_URL, "/api/v1/request", SEERR_API_KEY, payload)
 
 
@@ -290,16 +295,41 @@ async def search_media(update: Update, context: ContextTypes.DEFAULT_TYPE, media
             if len(overview) > 350:
                 overview = overview[:347] + "..."
             s = (item.get("mediaInfo") or {}).get("status")
+            rows = []
+
             if s == 5:
-                button = InlineKeyboardButton("â DÃ©jÃ  disponible", callback_data="noop")
+                if JELLYFIN_PUBLIC_URL:
+                    rows.append([
+                        InlineKeyboardButton("â¶ï¸ Ouvrir Jellyfin", url=JELLYFIN_PUBLIC_URL)
+                    ])
+                else:
+                    rows.append([
+                        InlineKeyboardButton("â DÃ©jÃ  disponible", callback_data="noop")
+                    ])
             elif s in {2, 3, 4}:
-                button = InlineKeyboardButton("ð DÃ©jÃ  demandÃ©", callback_data="noop")
+                rows.append([
+                    InlineKeyboardButton("ð DÃ©jÃ  demandÃ©", callback_data="noop")
+                ])
             else:
-                button = InlineKeyboardButton("â Demander", callback_data=f"request:{media_type}:{media_id}")
+                if media_type == "tv":
+                    rows.append([
+                        InlineKeyboardButton(
+                            "ðº Choisir les saisons",
+                            callback_data=f"tvseasons:{media_id}"
+                        )
+                    ])
+                else:
+                    rows.append([
+                        InlineKeyboardButton(
+                            "â Demander",
+                            callback_data=f"request:movie:{media_id}"
+                        )
+                    ])
+
             caption = f"<b>{title}</b> ({year})\n{status_text(item)}"
             if overview:
                 caption += f"\n\n{overview}"
-            markup = InlineKeyboardMarkup([[button]])
+            markup = InlineKeyboardMarkup(rows)
             poster = item.get("posterPath")
             if poster:
                 try:
@@ -330,23 +360,144 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
+
     if q.data == "noop":
         return await q.answer()
+
     if not is_allowed(update):
         return await q.answer("Non autorisÃ©", show_alert=True)
+
     await q.answer()
-    parts = q.data.split(":")
-    if len(parts) != 3 or parts[0] != "request":
-        return
-    _, media_type, media_id = parts
-    try:
-        await seerr_request(media_type, int(media_id))
-        await q.edit_message_reply_markup(
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("â Demande envoyÃ©e", callback_data="noop")]])
-        )
-    except Exception:
-        log.exception("Erreur demande Seerr")
-        await q.answer("Impossible d'envoyer la demande.", show_alert=True)
+
+    # 1) Choix des saisons d'une sÃ©rie
+    if q.data.startswith("tvseasons:"):
+        try:
+            media_id = int(q.data.split(":", 1)[1])
+            details = await seerr_tv_details(media_id)
+
+            seasons = []
+            for season in details.get("seasons", []):
+                number = season.get("seasonNumber")
+                name = season.get("name") or f"Saison {number}"
+                if isinstance(number, int) and number > 0:
+                    seasons.append((number, name))
+
+            if not seasons:
+                return await q.answer("Aucune saison trouvÃ©e.", show_alert=True)
+
+            rows = []
+            current_row = []
+
+            for number, _name in seasons:
+                current_row.append(
+                    InlineKeyboardButton(
+                        f"Saison {number}",
+                        callback_data=f"requestseason:{media_id}:{number}"
+                    )
+                )
+                if len(current_row) == 2:
+                    rows.append(current_row)
+                    current_row = []
+
+            if current_row:
+                rows.append(current_row)
+
+            rows.append([
+                InlineKeyboardButton(
+                    "ð Toutes les saisons",
+                    callback_data=f"requestall:{media_id}"
+                )
+            ])
+
+            await q.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(rows)
+            )
+            return
+
+        except Exception:
+            log.exception("Erreur rÃ©cupÃ©ration saisons Seerr")
+            return await q.answer(
+                "Impossible de rÃ©cupÃ©rer les saisons.",
+                show_alert=True
+            )
+
+    # 2) Demande d'une saison prÃ©cise
+    if q.data.startswith("requestseason:"):
+        try:
+            _, media_id_raw, season_raw = q.data.split(":")
+            media_id = int(media_id_raw)
+            season = int(season_raw)
+
+            await seerr_request("tv", media_id, [season])
+
+            await q.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        f"â Saison {season} demandÃ©e",
+                        callback_data="noop"
+                    )
+                ]])
+            )
+            return
+
+        except Exception:
+            log.exception("Erreur demande saison Seerr")
+            return await q.answer(
+                "Impossible d'envoyer la demande.",
+                show_alert=True
+            )
+
+    # 3) Demande de toutes les saisons
+    if q.data.startswith("requestall:"):
+        try:
+            media_id = int(q.data.split(":", 1)[1])
+
+            await seerr_request("tv", media_id, "all")
+
+            await q.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "â Toutes les saisons demandÃ©es",
+                        callback_data="noop"
+                    )
+                ]])
+            )
+            return
+
+        except Exception:
+            log.exception("Erreur demande toutes saisons Seerr")
+            return await q.answer(
+                "Impossible d'envoyer la demande.",
+                show_alert=True
+            )
+
+    # 4) Film
+    if q.data.startswith("request:"):
+        parts = q.data.split(":")
+        if len(parts) != 3:
+            return
+
+        _, media_type, media_id_raw = parts
+
+        try:
+            media_id = int(media_id_raw)
+            await seerr_request(media_type, media_id)
+
+            await q.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "â Demande envoyÃ©e",
+                        callback_data="noop"
+                    )
+                ]])
+            )
+
+        except Exception:
+            log.exception("Erreur demande Seerr")
+            await q.answer(
+                "Impossible d'envoyer la demande.",
+                show_alert=True
+            )
 
 
 async def get_imports(url, api_key, page_size=30):
