@@ -33,13 +33,11 @@ services:
     volumes:
       - telegram_bot_data:/data
 
-    # Si tes apps sont sur un réseau Docker externe commun, décommente
-    # ces 2 lignes et adapte le nom du réseau plus bas.
     # networks:
     #   - media
 
-volumes:
-  telegram_bot_data:
+# volumes:
+#   telegram_bot_data:
 
 # networks:
 #   media:
