@@ -40,6 +40,7 @@ TOPICS_FILE = DATA_DIR / "topics.json"
 STATE_FILE = DATA_DIR / "state.json"
 USERS_FILE = DATA_DIR / "users.json"
 REQUESTS_FILE = DATA_DIR / "requests.json"
+PENDING_FILE = DATA_DIR / "pending_requests.json"
 TMDB_POSTER_BASE = "https://image.tmdb.org/t/p/w500"
 
 
@@ -76,6 +77,7 @@ topics = load_json(TOPICS_FILE, {})
 state = load_json(STATE_FILE, {"initialized": False, "radarr_seen": [], "sonarr_seen": []})
 users = load_json(USERS_FILE, {})
 requests_db = load_json(REQUESTS_FILE, [])
+pending_db = load_json(PENDING_FILE, {})
 
 
 def is_admin_user_id(user_id: int) -> bool:
@@ -96,7 +98,7 @@ def is_allowed(update: Update) -> bool:
     if not user or not chat:
         return False
 
-    # Le bot n'accepte que le groupe Media Server ou les conversations privÃ©es.
+    # Le bot n'accepte que le groupe Media Server ou les conversations privées.
     if chat.type != "private" and TELEGRAM_CHAT_ID:
         try:
             if chat.id != int(TELEGRAM_CHAT_ID):
@@ -125,7 +127,7 @@ def remove_user(user_id: int):
 
 async def deny(update: Update):
     if update.effective_message:
-        await update.effective_message.reply_text("â Tu n'es pas autorisÃ© Ã  utiliser ce bot.")
+        await update.effective_message.reply_text("⛔ Tu n'es pas autorisé à utiliser ce bot.")
 
 
 async def remember_topic(update: Update):
@@ -150,8 +152,8 @@ def find_topic_id(*names: str) -> Optional[int]:
             except Exception:
                 pass
     fallback = {
-        "annonces": 2, "films": 3, "film": 3, "sÃ©rie": 5, "series": 5, "sÃ©ries": 5, "serie": 5,
-        "demande": 6, "demandes": 6, "jellyfin": 7, "serveur": 8, "server": 8, "gÃ©nÃ©ral": 9, "general": 9
+        "annonces": 2, "films": 3, "film": 3, "série": 5, "series": 5, "séries": 5, "serie": 5,
+        "demande": 6, "demandes": 6, "jellyfin": 7, "serveur": 8, "server": 8, "général": 9, "general": 9
     }
     for name in wanted:
         if name in fallback:
@@ -225,16 +227,16 @@ async def api_post(url, path, api_key="", payload=None, timeout=15.0):
 def status_text(item):
     status = (item.get("mediaInfo") or {}).get("status")
     return {
-        2: "ð¡ En attente",
-        3: "ð  En traitement",
-        4: "ð¢ Partiellement disponible",
-        5: "â Disponible",
-    }.get(status, "â Pas encore demandÃ©")
+        2: "🟡 En attente",
+        3: "🟠 En traitement",
+        4: "🟢 Partiellement disponible",
+        5: "✅ Disponible",
+    }.get(status, "➕ Pas encore demandé")
 
 
 async def seerr_search(query: str, media_type: str):
     # IMPORTANT:
-    # httpx encode normalement les paramÃ¨tres de formulaire avec "+" pour les espaces.
+    # httpx encode normalement les paramètres de formulaire avec "+" pour les espaces.
     # Seerr 3.4.x refuse ce format. On construit donc ici la query brute avec %20.
     encoded_query = quote(query, safe="")
     base = httpx.URL(f"{SEERR_URL}/api/v1/search")
@@ -284,11 +286,164 @@ def title_from_callback_message(message) -> str:
     lines = [x.strip() for x in raw.splitlines() if x.strip()]
     if not lines:
         return ""
-    if lines[0].startswith(("ð¬ Film", "ðº SÃ©rie")) and len(lines) > 1:
+    if lines[0].startswith(("🎬 Film", "📺 Série")) and len(lines) > 1:
         title = lines[1]
     else:
         title = lines[0]
     return re.sub(r"\s+\(\d{4}|\?\)$", "", title).strip()
+
+
+async def submit_for_admin(update: Update, media_type: str, media_id: int, seasons=None):
+    user = update.effective_user
+    q = update.callback_query
+    message = q.message if q else update.effective_message
+    if not user or not message:
+        return
+
+    title = title_from_callback_message(message) or "Contenu"
+    pending_id = str(int(time.time() * 1000))
+    pending_db[pending_id] = {
+        "user_id": user.id,
+        "first_name": user.first_name or "",
+        "media_type": media_type,
+        "media_id": int(media_id),
+        "title": title,
+        "seasons": seasons,
+        "status": "pending",
+        "created_at": int(time.time()),
+    }
+    save_json(PENDING_FILE, pending_db)
+
+    kind = "🎬 Film" if media_type == "movie" else "📺 Série"
+    season_text = ""
+    if seasons == "all":
+        season_text = "\n📚 Toutes les saisons"
+    elif isinstance(seasons, list) and seasons:
+        season_text = f"\n📺 Saison {seasons[0]}"
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Accepter", callback_data=f"approve:{pending_id}"),
+        InlineKeyboardButton("❌ Refuser", callback_data=f"reject:{pending_id}")
+    ]])
+
+    await update.get_bot().send_message(
+        chat_id=int(TELEGRAM_CHAT_ID),
+        message_thread_id=find_topic_id("Jellyfin"),
+        text=(
+            "🟣 <b>Nouvelle demande</b>\n\n"
+            f"{kind} : <b>{html.escape(title)}</b>{season_text}\n"
+            f"👤 Demandé par : <b>{html.escape(user.first_name or 'Utilisateur')}</b>"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+    await message.reply_text(
+        "✅ <b>Ta demande a bien été envoyée dans le topic Jellyfin.</b>\n"
+        "🔔 Tu recevras ici la réponse après validation.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def save_accepted_request(req):
+    tvdb_id = None
+    if req["media_type"] == "tv":
+        try:
+            details = await seerr_tv_details(int(req["media_id"]))
+            external = details.get("externalIds") or {}
+            tvdb_id = external.get("tvdbId") or details.get("tvdbId")
+        except Exception:
+            log.exception("TVDB ID introuvable")
+
+    requests_db.append({
+        "user_id": int(req["user_id"]),
+        "first_name": req.get("first_name", ""),
+        "media_type": req["media_type"],
+        "media_id": int(req["media_id"]),
+        "tvdb_id": int(tvdb_id) if str(tvdb_id).isdigit() else None,
+        "title": req.get("title", ""),
+        "seasons": req.get("seasons"),
+        "created_at": int(time.time()),
+        "notified": False,
+    })
+    save_json(REQUESTS_FILE, requests_db)
+
+
+async def handle_admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.data or not q.data.startswith(("approve:", "reject:")):
+        return False
+
+    user = update.effective_user
+    if not user or not is_admin_user_id(user.id):
+        await q.answer("⛔ Seul l'administrateur peut décider.", show_alert=True)
+        return True
+
+    pending_id = q.data.split(":", 1)[1]
+    req = pending_db.get(pending_id)
+    if not req or req.get("status") != "pending":
+        await q.answer("Cette demande a déjà été traitée.", show_alert=True)
+        return True
+
+    title = req.get("title") or "Contenu"
+    requester_id = int(req["user_id"])
+
+    if q.data.startswith("approve:"):
+        try:
+            await seerr_request(
+                req["media_type"],
+                int(req["media_id"]),
+                req.get("seasons")
+            )
+            req["status"] = "approved"
+            req["decided_at"] = int(time.time())
+            save_json(PENDING_FILE, pending_db)
+            await save_accepted_request(req)
+
+            await q.answer("Demande acceptée.")
+            await q.edit_message_text(
+                f"✅ <b>Demande acceptée</b>\n\n<b>{html.escape(title)}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            await context.bot.send_message(
+                chat_id=requester_id,
+                text=f"✅ <b>Ta demande a été acceptée !</b>\n\n<b>{html.escape(title)}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            await send_to_topic(
+                context.application,
+                ("Général", "General"),
+                f"✅ La demande de <b>{html.escape(title)}</b> a été acceptée."
+            )
+        except Exception:
+            log.exception("Erreur acceptation demande")
+            await q.answer("Erreur lors de l'envoi vers Seerr.", show_alert=True)
+        return True
+
+    req["status"] = "rejected"
+    req["decided_at"] = int(time.time())
+    save_json(PENDING_FILE, pending_db)
+
+    await q.answer("Demande refusée.")
+    await q.edit_message_text(
+        f"❌ <b>Demande refusée</b>\n\n<b>{html.escape(title)}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=requester_id,
+            text=f"❌ <b>Ta demande a été refusée.</b>\n\n<b>{html.escape(title)}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        log.exception("MP de refus impossible")
+
+    await send_to_topic(
+        context.application,
+        ("Général", "General"),
+        f"❌ La demande de <b>{html.escape(title)}</b> n'a pas été acceptée."
+    )
+    return True
 
 
 async def record_private_request(update: Update, media_type: str, media_id: int, seasons=None):
@@ -308,7 +463,7 @@ async def record_private_request(update: Update, media_type: str, media_id: int,
             if not title:
                 title = details.get("name") or details.get("title") or ""
         except Exception:
-            log.exception("Impossible de rÃ©cupÃ©rer le TVDB ID pour la demande")
+            log.exception("Impossible de récupérer le TVDB ID pour la demande")
 
     entry = {
         "user_id": user.id,
@@ -362,13 +517,13 @@ async def notify_private_requests(app: Application, media_type: str, item: dict,
         if not match:
             continue
 
-        kind = "ð¬ Votre film est disponible !" if media_type == "movie" else "ðº Votre sÃ©rie est disponible !"
+        kind = "🎬 Votre film est disponible !" if media_type == "movie" else "📺 Votre série est disponible !"
         caption = f"{kind}\n\n<b>{html.escape(item_title or req.get('title') or 'Contenu')}</b>"
         if extra:
             caption += f"\n{html.escape(extra)}"
         if JELLYFIN_PUBLIC_URL:
             keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("â¶ï¸ Ouvrir Jellyfin", url=JELLYFIN_PUBLIC_URL)
+                InlineKeyboardButton("▶️ Ouvrir Jellyfin", url=JELLYFIN_PUBLIC_URL)
             ]])
         else:
             keyboard = None
@@ -393,8 +548,8 @@ async def notify_private_requests(app: Application, media_type: str, item: dict,
             req["notified_at"] = int(time.time())
             changed = True
         except Exception:
-            # Telegram interdit au bot d'initier un MP si la personne n'a jamais dÃ©marrÃ© le bot.
-            log.exception("Notification privÃ©e impossible pour user_id=%s", req.get("user_id"))
+            # Telegram interdit au bot d'initier un MP si la personne n'a jamais démarré le bot.
+            log.exception("Notification privée impossible pour user_id=%s", req.get("user_id"))
 
     if changed:
         save_json(REQUESTS_FILE, requests_db)
@@ -405,7 +560,7 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not update.effective_message:
         return
     await update.effective_message.reply_text(
-        f"ð Ton User ID Telegram : <code>{user.id}</code>",
+        f"🆔 Ton User ID Telegram : <code>{user.id}</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -416,16 +571,16 @@ async def allow_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await deny(update)
 
     if not context.args:
-        return await update.effective_message.reply_text("Utilisation : /allow USER_ID PrÃ©nom")
+        return await update.effective_message.reply_text("Utilisation : /allow USER_ID Prénom")
 
     try:
         user_id = int(context.args[0])
     except ValueError:
-        return await update.effective_message.reply_text("â USER_ID invalide.")
+        return await update.effective_message.reply_text("❌ USER_ID invalide.")
 
     name = " ".join(context.args[1:]).strip()
     save_user(user_id, first_name=name, source="admin")
-    await update.effective_message.reply_text(f"â Utilisateur {user_id} autorisÃ©.")
+    await update.effective_message.reply_text(f"✅ Utilisateur {user_id} autorisé.")
 
 
 async def remove_allowed_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -439,13 +594,13 @@ async def remove_allowed_user(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         user_id = int(context.args[0])
     except ValueError:
-        return await update.effective_message.reply_text("â USER_ID invalide.")
+        return await update.effective_message.reply_text("❌ USER_ID invalide.")
 
     if is_admin_user_id(user_id):
-        return await update.effective_message.reply_text("â ï¸ Un administrateur dÃ©fini dans ADMIN_USER_IDS ne peut pas Ãªtre retirÃ© ici.")
+        return await update.effective_message.reply_text("⚠️ Un administrateur défini dans ADMIN_USER_IDS ne peut pas être retiré ici.")
 
     remove_user(user_id)
-    await update.effective_message.reply_text(f"â Utilisateur {user_id} retirÃ©.")
+    await update.effective_message.reply_text(f"✅ Utilisateur {user_id} retiré.")
 
 
 async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -453,15 +608,15 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user or not is_admin_user_id(user.id):
         return await deny(update)
 
-    lines = ["ð¥ <b>Utilisateurs autorisÃ©s</b>", ""]
+    lines = ["👥 <b>Utilisateurs autorisés</b>", ""]
     for uid in sorted(ADMIN_USER_IDS):
-        lines.append(f"ð <code>{uid}</code> â administrateur")
+        lines.append(f"👑 <code>{uid}</code> — administrateur")
     for uid, info in sorted(users.items(), key=lambda x: x[1].get("first_name", "")):
         name = html.escape(info.get("first_name") or info.get("username") or "Sans nom")
-        lines.append(f"ð¤ {name} â <code>{uid}</code>")
+        lines.append(f"👤 {name} — <code>{uid}</code>")
     for uid in sorted(ALLOWED_USER_IDS):
         if uid not in ADMIN_USER_IDS and str(uid) not in users:
-            lines.append(f"ð¤ <code>{uid}</code> â variable Coolify")
+            lines.append(f"👤 <code>{uid}</code> — variable Coolify")
 
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -481,7 +636,7 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
         if member.is_bot:
             continue
 
-        # Un membre qui rejoint le groupe est automatiquement autorisÃ© Ã  utiliser le bot en MP.
+        # Un membre qui rejoint le groupe est automatiquement autorisé à utiliser le bot en MP.
         save_user(
             member.id,
             first_name=member.first_name or "",
@@ -491,13 +646,13 @@ async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         name = html.escape(member.first_name or "Bienvenue")
         welcome = (
-            f"ð <b>Bienvenue {name} !</b>\n\n"
-            "ð¬ Les nouveaux films disponibles sont publiÃ©s dans <b>Films</b>.\n"
-            "ðº Les nouvelles sÃ©ries/Ã©pisodes disponibles sont publiÃ©s dans <b>SÃ©ries</b>.\n\n"
-            "ð Pour faire une demande sans que les autres membres la voient, utilise le bot en <b>message privÃ©</b>."
+            f"👋 <b>Bienvenue {name} !</b>\n\n"
+            "🎬 Les nouveaux films disponibles sont publiés dans <b>Films</b>.\n"
+            "📺 Les nouvelles séries/épisodes disponibles sont publiés dans <b>Séries</b>.\n\n"
+            "🔒 Pour faire une demande sans que les autres membres la voient, utilise le bot en <b>message privé</b>."
         )
         markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton("ð¤ Faire une demande en privÃ©", url=bot_url)
+            InlineKeyboardButton("🤖 Faire une demande en privé", url=bot_url)
         ]])
 
         thread_id = find_topic_id("Bienvenue", "Welcome")
@@ -533,24 +688,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if chat and chat.type == "private":
         await msg.reply_text(
-            "ð  <b>Media Server</b>\n\n"
-            "ð Cette conversation est privÃ©e. Les autres membres du groupe ne voient pas tes recherches ni tes demandes.\n\n"
-            "Ãcris simplement le nom d'un film ou d'une sÃ©rie, par exemple :\n"
+            "🏠 <b>Media Server</b>\n\n"
+            "🔒 Cette conversation est privée. Les autres membres du groupe ne voient pas tes recherches ni tes demandes.\n\n"
+            "Écris simplement le nom d'un film ou d'une série, par exemple :\n"
             "<code>Dune</code>\n"
             "<code>Breaking Bad</code>\n\n"
-            "Je te prÃ©viendrai ici lorsque ton contenu sera disponible sur Jellyfin.",
+            "Je te préviendrai ici lorsque ton contenu sera disponible sur Jellyfin.",
             parse_mode=ParseMode.HTML,
         )
     else:
         me = await context.bot.get_me()
         markup = InlineKeyboardMarkup([[
             InlineKeyboardButton(
-                "ð¤ Ouvrir le bot en privÃ©",
+                "🤖 Ouvrir le bot en privé",
                 url=f"https://t.me/{me.username}?start=media"
             )
         ]])
         await msg.reply_text(
-            "ð Les demandes de films et sÃ©ries se font maintenant en message privÃ© avec le bot.",
+            "🔒 Les demandes de films et séries se font maintenant en message privé avec le bot.",
             reply_markup=markup,
         )
 
@@ -573,7 +728,7 @@ async def topicid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await deny(update)
     msg = update.effective_message
     if msg.message_thread_id is None:
-        return await msg.reply_text("â ï¸ Lance cette commande dans un Topic.")
+        return await msg.reply_text("⚠️ Lance cette commande dans un Topic.")
     name = " ".join(context.args).strip() or f"Topic {msg.message_thread_id}"
     topics[str(msg.message_thread_id)] = {
         "name": name,
@@ -581,26 +736,26 @@ async def topicid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "thread_id": msg.message_thread_id,
     }
     save_json(TOPICS_FILE, topics)
-    await msg.reply_text(f"â {name} = {msg.message_thread_id}")
+    await msg.reply_text(f"✅ {name} = {msg.message_thread_id}")
 
 
 async def topics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return await deny(update)
-    lines = ["ðï¸ <b>Topics mÃ©morisÃ©s</b>", ""]
+    lines = ["🗂️ <b>Topics mémorisés</b>", ""]
     for item in sorted(topics.values(), key=lambda x: x.get("thread_id", 0)):
-        lines.append(f"â¢ {item.get('name', 'Sans nom')} : <code>{item.get('thread_id')}</code>")
+        lines.append(f"• {item.get('name', 'Sans nom')} : <code>{item.get('thread_id')}</code>")
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def check_service(name, url, path, api_key=""):
     if not url:
-        return f"âª {name} â non configurÃ©"
+        return f"⚪ {name} — non configuré"
     try:
         await api_get(url, path, api_key, timeout=5.0)
-        return f"ð¢ {name}"
+        return f"🟢 {name}"
     except Exception:
-        return f"ð´ {name} â inaccessible"
+        return f"🔴 {name} — inaccessible"
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -612,7 +767,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await check_service("Sonarr", SONARR_URL, "/api/v3/system/status", SONARR_API_KEY),
         await check_service("Seerr", SEERR_URL, "/api/v1/status", SEERR_API_KEY),
     ]
-    await update.effective_message.reply_text("ð¥ï¸ <b>MEDIA SERVER</b>\n\n" + "\n".join(results), parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text("🖥️ <b>MEDIA SERVER</b>\n\n" + "\n".join(results), parse_mode=ParseMode.HTML)
 
 
 async def search_media(update: Update, context: ContextTypes.DEFAULT_TYPE, media_type: str):
@@ -624,7 +779,7 @@ async def search_media(update: Update, context: ContextTypes.DEFAULT_TYPE, media
     try:
         results = await seerr_search(query, media_type)
         if not results:
-            return await update.effective_message.reply_text("â Aucun rÃ©sultat.")
+            return await update.effective_message.reply_text("❌ Aucun résultat.")
         for item in results:
             media_id = item.get("id")
             title = item.get("title") or item.get("name") or "Sans titre"
@@ -639,28 +794,28 @@ async def search_media(update: Update, context: ContextTypes.DEFAULT_TYPE, media
             if s == 5:
                 if JELLYFIN_PUBLIC_URL:
                     rows.append([
-                        InlineKeyboardButton("â¶ï¸ Ouvrir Jellyfin", url=JELLYFIN_PUBLIC_URL)
+                        InlineKeyboardButton("▶️ Ouvrir Jellyfin", url=JELLYFIN_PUBLIC_URL)
                     ])
                 else:
                     rows.append([
-                        InlineKeyboardButton("â DÃ©jÃ  disponible", callback_data="noop")
+                        InlineKeyboardButton("✅ Déjà disponible", callback_data="noop")
                     ])
             elif s in {2, 3, 4}:
                 rows.append([
-                    InlineKeyboardButton("ð DÃ©jÃ  demandÃ©", callback_data="noop")
+                    InlineKeyboardButton("🕒 Déjà demandé", callback_data="noop")
                 ])
             else:
                 if media_type == "tv":
                     rows.append([
                         InlineKeyboardButton(
-                            "ðº Choisir les saisons",
+                            "📺 Choisir les saisons",
                             callback_data=f"tvseasons:{media_id}"
                         )
                     ])
                 else:
                     rows.append([
                         InlineKeyboardButton(
-                            "â Demander",
+                            "➕ Demander",
                             callback_data=f"request:movie:{media_id}"
                         )
                     ])
@@ -684,7 +839,7 @@ async def search_media(update: Update, context: ContextTypes.DEFAULT_TYPE, media
             await update.effective_message.reply_text(caption, parse_mode=ParseMode.HTML, reply_markup=markup)
     except Exception as e:
         log.exception("Erreur recherche Seerr")
-        await update.effective_message.reply_text(f"ð´ Erreur Seerr : {type(e).__name__}")
+        await update.effective_message.reply_text(f"🔴 Erreur Seerr : {type(e).__name__}")
 
 
 async def send_mixed_result(message, item: dict):
@@ -705,27 +860,27 @@ async def send_mixed_result(message, item: dict):
 
     if s == 5:
         if JELLYFIN_PUBLIC_URL:
-            rows.append([InlineKeyboardButton("â¶ï¸ Ouvrir Jellyfin", url=JELLYFIN_PUBLIC_URL)])
+            rows.append([InlineKeyboardButton("▶️ Ouvrir Jellyfin", url=JELLYFIN_PUBLIC_URL)])
         else:
-            rows.append([InlineKeyboardButton("â DÃ©jÃ  disponible", callback_data="noop")])
+            rows.append([InlineKeyboardButton("✅ Déjà disponible", callback_data="noop")])
     elif s in {2, 3, 4}:
-        rows.append([InlineKeyboardButton("ð DÃ©jÃ  demandÃ©", callback_data="noop")])
+        rows.append([InlineKeyboardButton("🕒 Déjà demandé", callback_data="noop")])
     elif media_type == "tv":
         rows.append([
             InlineKeyboardButton(
-                "ðº Choisir les saisons",
+                "📺 Choisir les saisons",
                 callback_data=f"tvseasons:{media_id}"
             )
         ])
     else:
         rows.append([
             InlineKeyboardButton(
-                "ð¬ Demander le film",
+                "🎬 Demander le film",
                 callback_data=f"request:movie:{media_id}"
             )
         ])
 
-    kind = "ð¬ Film" if media_type == "movie" else "ðº SÃ©rie"
+    kind = "🎬 Film" if media_type == "movie" else "📺 Série"
     caption = f"{kind}\n<b>{title}</b> ({year})\n{status_text(item)}"
     if overview:
         caption += f"\n\n{overview}"
@@ -753,7 +908,7 @@ async def send_mixed_result(message, item: dict):
 
 
 async def natural_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """En MP, un simple titre lance une recherche film + sÃ©rie."""
+    """En MP, un simple titre lance une recherche film + série."""
     if not is_allowed(update):
         return
 
@@ -761,7 +916,7 @@ async def natural_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.text:
         return
 
-    # Aucune recherche publique dans le groupe : confidentialitÃ© des demandes.
+    # Aucune recherche publique dans le groupe : confidentialité des demandes.
     if not update.effective_chat or update.effective_chat.type != "private":
         return
 
@@ -791,11 +946,11 @@ async def natural_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = [x for x in results if x.get("mediaType") in {"movie", "tv"}][:6]
 
         if not results:
-            await msg.reply_text("â Aucun film ou sÃ©rie trouvÃ©.")
+            await msg.reply_text("❌ Aucun film ou série trouvé.")
             return
 
         await msg.reply_text(
-            f"ð RÃ©sultats pour <b>{query}</b> :",
+            f"🔎 Résultats pour <b>{query}</b> :",
             parse_mode=ParseMode.HTML
         )
 
@@ -804,7 +959,7 @@ async def natural_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         log.exception("Erreur recherche naturelle Seerr")
-        await msg.reply_text(f"ð´ Erreur Seerr : {type(e).__name__}")
+        await msg.reply_text(f"🔴 Erreur Seerr : {type(e).__name__}")
 
 
 async def film(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -820,15 +975,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q:
         return
 
+    if await handle_admin_decision(update, context):
+        return
+
     if q.data == "noop":
         return await q.answer()
 
     if not is_allowed(update):
-        return await q.answer("Non autorisÃ©", show_alert=True)
+        return await q.answer("Non autorisé", show_alert=True)
 
     await q.answer()
 
-    # 1) Choix des saisons d'une sÃ©rie
+    # 1) Choix des saisons d'une série
     if q.data.startswith("tvseasons:"):
         try:
             media_id = int(q.data.split(":", 1)[1])
@@ -842,7 +1000,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     seasons.append((number, name))
 
             if not seasons:
-                return await q.answer("Aucune saison trouvÃ©e.", show_alert=True)
+                return await q.answer("Aucune saison trouvée.", show_alert=True)
 
             rows = []
             current_row = []
@@ -863,7 +1021,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             rows.append([
                 InlineKeyboardButton(
-                    "ð Toutes les saisons",
+                    "📚 Toutes les saisons",
                     callback_data=f"requestall:{media_id}"
                 )
             ])
@@ -874,26 +1032,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         except Exception:
-            log.exception("Erreur rÃ©cupÃ©ration saisons Seerr")
+            log.exception("Erreur récupération saisons Seerr")
             return await q.answer(
-                "Impossible de rÃ©cupÃ©rer les saisons.",
+                "Impossible de récupérer les saisons.",
                 show_alert=True
             )
 
-    # 2) Demande d'une saison prÃ©cise
+    # 2) Demande d'une saison précise
     if q.data.startswith("requestseason:"):
         try:
             _, media_id_raw, season_raw = q.data.split(":")
             media_id = int(media_id_raw)
             season = int(season_raw)
 
-            await seerr_request("tv", media_id, [season])
-            await record_private_request(update, "tv", media_id, [season])
+            await submit_for_admin(update, "tv", media_id, [season])
 
             await q.edit_message_reply_markup(
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton(
-                        f"â Saison {season} demandÃ©e",
+                        f"⏳ Saison {season} en attente",
                         callback_data="noop"
                     )
                 ]])
@@ -912,13 +1069,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             media_id = int(q.data.split(":", 1)[1])
 
-            await seerr_request("tv", media_id, "all")
-            await record_private_request(update, "tv", media_id, "all")
+            await submit_for_admin(update, "tv", media_id, "all")
 
             await q.edit_message_reply_markup(
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton(
-                        "â Toutes les saisons demandÃ©es",
+                        "⏳ Validation en attente",
                         callback_data="noop"
                     )
                 ]])
@@ -942,13 +1098,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             media_id = int(media_id_raw)
-            await seerr_request(media_type, media_id)
-            await record_private_request(update, media_type, media_id)
+            await submit_for_admin(update, media_type, media_id)
 
             await q.edit_message_reply_markup(
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton(
-                        "â Demande envoyÃ©e",
+                        "⏳ Validation en attente",
                         callback_data="noop"
                     )
                 ]])
@@ -1003,8 +1158,8 @@ async def monitor_imports(app: Application):
                         poster = arr_poster(movie)
                     except Exception:
                         pass
-                    quality = (((r.get("quality") or {}).get("quality") or {}).get("name") or "QualitÃ© inconnue")
-                    caption = f"ð¬ <b>Nouveau film disponible !</b>\n\n<b>{title}</b>\nðï¸ {quality}\n\nâ¶ï¸ Disponible prochainement dans Jellyfin."
+                    quality = (((r.get("quality") or {}).get("quality") or {}).get("name") or "Qualité inconnue")
+                    caption = f"🎬 <b>Nouveau film disponible !</b>\n\n<b>{title}</b>\n🎞️ {quality}\n\n▶️ Disponible prochainement dans Jellyfin."
                     sent = await send_photo_to_topic(app, ("Films", "Film"), poster, caption)
                     if not sent:
                         await send_to_topic(app, ("Films", "Film"), caption)
@@ -1014,13 +1169,13 @@ async def monitor_imports(app: Application):
                             poster=poster
                         )
                     except Exception:
-                        log.exception("Erreur notification privÃ©e film")
+                        log.exception("Erreur notification privée film")
 
                 for r in reversed(sonarr):
                     if str(r.get("id")) in sseen:
                         continue
                     series_id = r.get("seriesId")
-                    title = f"SÃ©rie #{series_id}"
+                    title = f"Série #{series_id}"
                     poster = ""
                     show = {"title": title}
                     try:
@@ -1029,12 +1184,12 @@ async def monitor_imports(app: Application):
                         poster = arr_poster(show)
                     except Exception:
                         pass
-                    source = (r.get("data") or {}).get("sourceTitle") or "Nouvel Ã©pisode"
-                    quality = (((r.get("quality") or {}).get("quality") or {}).get("name") or "QualitÃ© inconnue")
-                    caption = f"ðº <b>Nouvel Ã©pisode disponible !</b>\n\n<b>{title}</b>\n{source}\nðï¸ {quality}\n\nâ¶ï¸ Disponible prochainement dans Jellyfin."
-                    sent = await send_photo_to_topic(app, ("SÃ©rie", "SÃ©ries", "Serie", "Series"), poster, caption)
+                    source = (r.get("data") or {}).get("sourceTitle") or "Nouvel épisode"
+                    quality = (((r.get("quality") or {}).get("quality") or {}).get("name") or "Qualité inconnue")
+                    caption = f"📺 <b>Nouvel épisode disponible !</b>\n\n<b>{title}</b>\n{source}\n🎞️ {quality}\n\n▶️ Disponible prochainement dans Jellyfin."
+                    sent = await send_photo_to_topic(app, ("Série", "Séries", "Serie", "Series"), poster, caption)
                     if not sent:
-                        await send_to_topic(app, ("SÃ©rie", "SÃ©ries", "Serie", "Series"), caption)
+                        await send_to_topic(app, ("Série", "Séries", "Serie", "Series"), caption)
                     try:
                         await notify_private_requests(
                             app, "tv", show,
@@ -1042,7 +1197,7 @@ async def monitor_imports(app: Application):
                             extra=source
                         )
                     except Exception:
-                        log.exception("Erreur notification privÃ©e sÃ©rie")
+                        log.exception("Erreur notification privée série")
 
                 state["radarr_seen"] = rid[:100]
                 state["sonarr_seen"] = sid[:150]
@@ -1080,7 +1235,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, remove_member_on_leave), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_request), group=0)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, passive_topic_capture), group=1)
-    log.info("DÃ©marrage Telegram Media Bot v5")
+    log.info("Démarrage Telegram Media Bot v6")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
