@@ -275,7 +275,31 @@ async def seerr_request(media_type: str, media_id: int, seasons=None):
     payload = {"mediaType": media_type, "mediaId": media_id}
     if media_type == "tv":
         payload["seasons"] = seasons if seasons is not None else "all"
-    return await api_post(SEERR_URL, "/api/v1/request", SEERR_API_KEY, payload)
+
+    created = await api_post(
+        SEERR_URL,
+        "/api/v1/request",
+        SEERR_API_KEY,
+        payload
+    )
+
+    # Seerr renvoie normalement la demande créée avec son ID.
+    request_id = created.get("id") if isinstance(created, dict) else None
+
+    if request_id:
+        await api_post(
+            SEERR_URL,
+            f"/api/v1/request/{request_id}/approve",
+            SEERR_API_KEY,
+            {}
+        )
+    else:
+        log.warning(
+            "Demande Seerr créée mais aucun ID reçu, impossible de l'approuver automatiquement: %r",
+            created
+        )
+
+    return created
 
 
 def normalize_title(value: str) -> str:
@@ -1405,7 +1429,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members), group=-1)
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, remove_member_on_leave), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_request), group=0)
-    log.info("Démarrage Telegram Media Bot v7.3")
+    log.info("Démarrage Telegram Media Bot v7.4")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
