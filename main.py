@@ -276,30 +276,41 @@ async def seerr_request(media_type: str, media_id: int, seasons=None):
     if media_type == "tv":
         payload["seasons"] = seasons if seasons is not None else "all"
 
-    created = await api_post(
-        SEERR_URL,
-        "/api/v1/request",
-        SEERR_API_KEY,
-        payload
-    )
+    headers = {"Content-Type": "application/json", "X-Api-Key": SEERR_API_KEY}
 
-    # Seerr renvoie normalement la demande créée avec son ID.
-    request_id = created.get("id") if isinstance(created, dict) else None
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        # 1. Création de la demande
+        create_url = f"{SEERR_URL}/api/v1/request"
+        r = await client.post(create_url, headers=headers, json=payload)
+        log.info("SEERR CREATE status=%s body=%s", r.status_code, r.text[:2000])
+        r.raise_for_status()
+        created = r.json() if r.content else {}
 
-    if request_id:
-        await api_post(
-            SEERR_URL,
-            f"/api/v1/request/{request_id}/approve",
-            SEERR_API_KEY,
-            {}
+        request_id = created.get("id") if isinstance(created, dict) else None
+        if not request_id:
+            raise RuntimeError(
+                f"Seerr a créé la demande mais n'a retourné aucun ID: {created!r}"
+            )
+
+        # 2. Approbation automatique
+        approve_url = f"{SEERR_URL}/api/v1/request/{request_id}/approve"
+        a = await client.post(approve_url, headers=headers)
+        log.info(
+            "SEERR APPROVE request_id=%s status=%s body=%s",
+            request_id, a.status_code, a.text[:2000]
         )
-    else:
-        log.warning(
-            "Demande Seerr créée mais aucun ID reçu, impossible de l'approuver automatiquement: %r",
-            created
-        )
+        a.raise_for_status()
 
-    return created
+        # 3. Vérification de l'état réel de la demande
+        verify_url = f"{SEERR_URL}/api/v1/request/{request_id}"
+        v = await client.get(verify_url, headers=headers)
+        log.info(
+            "SEERR VERIFY request_id=%s status=%s body=%s",
+            request_id, v.status_code, v.text[:2000]
+        )
+        v.raise_for_status()
+
+        return v.json() if v.content else created
 
 
 def normalize_title(value: str) -> str:
@@ -1429,7 +1440,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members), group=-1)
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, remove_member_on_leave), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_request), group=0)
-    log.info("Démarrage Telegram Media Bot v7.4")
+    log.info("Démarrage Telegram Media Bot v7.5")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
