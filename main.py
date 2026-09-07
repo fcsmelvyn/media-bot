@@ -1405,8 +1405,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members), group=-1)
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, remove_member_on_leave), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_request), group=0)
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, passive_topic_capture), group=1)
-    log.info("Démarrage Telegram Media Bot v7.2")
+    log.info("Démarrage Telegram Media Bot v7.3")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
