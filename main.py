@@ -74,7 +74,7 @@ def save_json(path: Path, data):
 
 
 topics = load_json(TOPICS_FILE, {})
-state = load_json(STATE_FILE, {"initialized": False, "radarr_seen": [], "sonarr_seen": []})
+state = load_json(STATE_FILE, {"initialized": False, "radarr_seen": [], "sonarr_seen": [], "service_status": {}})
 users = load_json(USERS_FILE, {})
 requests_db = load_json(REQUESTS_FILE, [])
 pending_db = load_json(PENDING_FILE, {})
@@ -152,8 +152,8 @@ def find_topic_id(*names: str) -> Optional[int]:
             except Exception:
                 pass
     fallback = {
-        "annonces": 2, "films": 3, "film": 3, "série": 5, "series": 5, "séries": 5, "serie": 5,
-        "demande": 6, "demandes": 6, "jellyfin": 7, "serveur": 8, "server": 8, "général": 9, "general": 9
+        "annonces": 2, "bienvenue": 82, "welcome": 82, "films": 103, "film": 103,
+        "série": 104, "series": 104, "séries": 104, "serie": 104, "jellyfin": 7, "serveur": 8, "server": 8, "général": 9, "general": 9
     }
     for name in wanted:
         if name in fallback:
@@ -975,9 +975,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q:
         return
 
-    if await handle_admin_decision(update, context):
-        return
-
     if q.data == "noop":
         return await q.answer()
 
@@ -1045,12 +1042,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             media_id = int(media_id_raw)
             season = int(season_raw)
 
-            await submit_for_admin(update, "tv", media_id, [season])
+            await seerr_request("tv", media_id, [season])
+            await record_private_request(update, "tv", media_id, [season])
 
             await q.edit_message_reply_markup(
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton(
-                        f"⏳ Saison {season} en attente",
+                        f"✅ Saison {season} envoyée à Seerr",
                         callback_data="noop"
                     )
                 ]])
@@ -1069,12 +1067,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             media_id = int(q.data.split(":", 1)[1])
 
-            await submit_for_admin(update, "tv", media_id, "all")
+            await seerr_request("tv", media_id, "all")
+            await record_private_request(update, "tv", media_id, "all")
 
             await q.edit_message_reply_markup(
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton(
-                        "⏳ Validation en attente",
+                        "✅ Envoyée à Seerr — en attente",
                         callback_data="noop"
                     )
                 ]])
@@ -1098,12 +1097,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             media_id = int(media_id_raw)
-            await submit_for_admin(update, media_type, media_id)
+            await seerr_request(media_type, media_id)
+            await record_private_request(update, media_type, media_id)
 
             await q.edit_message_reply_markup(
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton(
-                        "⏳ Validation en attente",
+                        "✅ Envoyée à Seerr — en attente",
                         callback_data="noop"
                     )
                 ]])
@@ -1127,10 +1127,37 @@ async def get_imports(url, api_key, page_size=30):
     return [r for r in data.get("records", []) if r.get("eventType") == "downloadFolderImported"]
 
 
+async def monitor_service_health(app: Application):
+    services = [
+        ("Radarr", RADARR_URL, "/api/v3/system/status", RADARR_API_KEY),
+        ("Sonarr", SONARR_URL, "/api/v3/system/status", SONARR_API_KEY),
+        ("Seerr", SEERR_URL, "/api/v1/status", SEERR_API_KEY),
+        ("Jellyfin", JELLYFIN_URL, "/System/Info/Public", ""),
+    ]
+    statuses = state.setdefault("service_status", {})
+    for name, url, path, api_key in services:
+        if not url:
+            continue
+        try:
+            await api_get(url, path, api_key, timeout=7.0)
+            current = "up"
+        except Exception:
+            current = "down"
+        previous = statuses.get(name)
+        if previous is not None and previous != current:
+            if current == "down":
+                await send_to_topic(app, ("Annonces",), f"🚨 <b>{html.escape(name)} est DOWN</b>\nLe service ne répond plus.")
+            else:
+                await send_to_topic(app, ("Annonces",), f"✅ <b>{html.escape(name)} est de nouveau en ligne.</b>")
+        statuses[name] = current
+    save_json(STATE_FILE, state)
+
+
 async def monitor_imports(app: Application):
     await asyncio.sleep(10)
     while True:
         try:
+            await monitor_service_health(app)
             radarr = await get_imports(RADARR_URL, RADARR_API_KEY, 30) if RADARR_URL and RADARR_API_KEY else []
             sonarr = await get_imports(SONARR_URL, SONARR_API_KEY, 40) if SONARR_URL and SONARR_API_KEY else []
             rid = [str(x.get("id")) for x in radarr if x.get("id") is not None]
@@ -1235,7 +1262,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, remove_member_on_leave), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_request), group=0)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, passive_topic_capture), group=1)
-    log.info("Démarrage Telegram Media Bot v6")
+    log.info("Démarrage Telegram Media Bot v7")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
