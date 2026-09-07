@@ -152,8 +152,11 @@ def find_topic_id(*names: str) -> Optional[int]:
             except Exception:
                 pass
     fallback = {
-        "annonces": 2, "bienvenue": 82, "welcome": 82, "films": 103, "film": 103,
-        "série": 104, "series": 104, "séries": 104, "serie": 104, "jellyfin": 7, "serveur": 8, "server": 8, "général": 9, "general": 9
+        "annonces": 105, "annonce": 105,
+        "bienvenue": 106, "bienvenu": 106, "welcome": 106,
+        "films": 103, "film": 103,
+        "série": 104, "series": 104, "séries": 104, "serie": 104,
+        "jellyfin": 7, "serveur": 8, "server": 8, "général": 9, "general": 9
     }
     for name in wanted:
         if name in fallback:
