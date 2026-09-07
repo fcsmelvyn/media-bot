@@ -831,7 +831,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return await deny(update)
     results = [
-        await check_service("Jellyfin", JELLYFIN_URL, "/System/Info/Public"),
+        await check_service("Jellyfin", JELLYFIN_URL, "/System/Info", JELLYFIN_API_KEY),
         await check_service("Radarr", RADARR_URL, "/api/v3/system/status", RADARR_API_KEY),
         await check_service("Sonarr", SONARR_URL, "/api/v3/system/status", SONARR_API_KEY),
         await check_service("Seerr", SEERR_URL, "/api/v1/status", SEERR_API_KEY),
@@ -1208,10 +1208,22 @@ async def monitor_service_health(app: Application):
         if not url:
             continue
         try:
-            await api_get(url, path, api_key, timeout=7.0)
+            # Pour Jellyfin, on utilise l'API authentifiée.
+            # Certains reverse proxies peuvent continuer à répondre sur
+            # /System/Info/Public même quand le serveur Jellyfin réel est indisponible.
+            if name == "Jellyfin":
+                await api_get(
+                    JELLYFIN_URL,
+                    "/System/Info",
+                    JELLYFIN_API_KEY,
+                    timeout=7.0,
+                )
+            else:
+                await api_get(url, path, api_key, timeout=7.0)
             current = "up"
-        except Exception:
+        except Exception as exc:
             current = "down"
+            log.warning("SERVICE DOWN détecté: %s (%s)", name, exc)
         previous = statuses.get(name)
         if previous is not None and previous != current:
             if current == "down":
@@ -1440,7 +1452,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members), group=-1)
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, remove_member_on_leave), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_request), group=0)
-    log.info("Démarrage Telegram Media Bot v7.5")
+    log.info("Démarrage Telegram Media Bot v7.6")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
