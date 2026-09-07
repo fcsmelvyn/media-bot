@@ -1187,90 +1187,199 @@ async def monitor_service_health(app: Application):
     save_json(STATE_FILE, state)
 
 
+async def get_arr_library(base_url: str, api_key: str, media_type: str):
+    """Retourne la liste actuelle Radarr/Sonarr pour détecter les nouveaux ajouts."""
+    if media_type == "movie":
+        return await api_get(base_url, "/api/v3/movie", api_key)
+    return await api_get(base_url, "/api/v3/series", api_key)
+
+
 async def monitor_imports(app: Application):
     await asyncio.sleep(10)
+
     while True:
         try:
             await monitor_service_health(app)
+
+            # Historique des téléchargements/imports terminés
             radarr = await get_imports(RADARR_URL, RADARR_API_KEY, 30) if RADARR_URL and RADARR_API_KEY else []
             sonarr = await get_imports(SONARR_URL, SONARR_API_KEY, 40) if SONARR_URL and SONARR_API_KEY else []
+
+            # Bibliothèques Radarr/Sonarr : sert à détecter le moment où
+            # une demande est ajoutée et passe "en cours de recherche".
+            radarr_library = await get_arr_library(RADARR_URL, RADARR_API_KEY, "movie") if RADARR_URL and RADARR_API_KEY else []
+            sonarr_library = await get_arr_library(SONARR_URL, SONARR_API_KEY, "tv") if SONARR_URL and SONARR_API_KEY else []
+
             rid = [str(x.get("id")) for x in radarr if x.get("id") is not None]
             sid = [str(x.get("id")) for x in sonarr if x.get("id") is not None]
+            movie_ids = [str(x.get("id")) for x in radarr_library if x.get("id") is not None]
+            series_ids = [str(x.get("id")) for x in sonarr_library if x.get("id") is not None]
 
             if not state.get("initialized"):
+                # Premier démarrage : mémorise l'existant sans spammer Telegram.
                 state["radarr_seen"] = rid
                 state["sonarr_seen"] = sid
+                state["radarr_library_seen"] = movie_ids
+                state["sonarr_library_seen"] = series_ids
                 state["initialized"] = True
                 save_json(STATE_FILE, state)
             else:
                 rseen = set(state.get("radarr_seen", []))
                 sseen = set(state.get("sonarr_seen", []))
+                movie_seen = set(state.get("radarr_library_seen", []))
+                series_seen = set(state.get("sonarr_library_seen", []))
 
+                # 1) Nouveau film ajouté à Radarr = recherche en cours
+                for movie in radarr_library:
+                    mid = str(movie.get("id"))
+                    if not mid or mid in movie_seen:
+                        continue
+
+                    title = movie.get("title") or f"Film #{mid}"
+                    poster = arr_poster(movie)
+                    caption = (
+                        "🔎 <b>Film en cours de recherche</b>\n\n"
+                        f"🎬 <b>{html.escape(title)}</b>\n"
+                        "Radarr recherche maintenant le film."
+                    )
+                    sent = await send_photo_to_topic(
+                        app, ("Films", "Film"), poster, caption
+                    )
+                    if not sent:
+                        await send_to_topic(app, ("Films", "Film"), caption)
+
+                # 2) Nouvelle série ajoutée à Sonarr = recherche en cours
+                for show in sonarr_library:
+                    sid_lib = str(show.get("id"))
+                    if not sid_lib or sid_lib in series_seen:
+                        continue
+
+                    title = show.get("title") or f"Série #{sid_lib}"
+                    poster = arr_poster(show)
+                    caption = (
+                        "🔎 <b>Série en cours de recherche</b>\n\n"
+                        f"📺 <b>{html.escape(title)}</b>\n"
+                        "Sonarr recherche maintenant les épisodes demandés."
+                    )
+                    sent = await send_photo_to_topic(
+                        app, ("Série", "Séries", "Serie", "Series"), poster, caption
+                    )
+                    if not sent:
+                        await send_to_topic(
+                            app, ("Série", "Séries", "Serie", "Series"), caption
+                        )
+
+                # 3) Film téléchargé/importé par Radarr = disponible dans Jellyfin
                 for r in reversed(radarr):
                     if str(r.get("id")) in rseen:
                         continue
+
                     movie_id = r.get("movieId")
                     title = f"Film #{movie_id}"
                     poster = ""
                     movie = {"title": title}
+
                     try:
-                        movie = await api_get(RADARR_URL, f"/api/v3/movie/{movie_id}", RADARR_API_KEY)
+                        movie = await api_get(
+                            RADARR_URL,
+                            f"/api/v3/movie/{movie_id}",
+                            RADARR_API_KEY,
+                        )
                         title = movie.get("title", title)
                         poster = arr_poster(movie)
                     except Exception:
                         pass
-                    quality = (((r.get("quality") or {}).get("quality") or {}).get("name") or "Qualité inconnue")
-                    caption = f"🎬 <b>Nouveau film disponible !</b>\n\n<b>{title}</b>\n🎞️ {quality}\n\n▶️ Disponible prochainement dans Jellyfin."
-                    sent = await send_photo_to_topic(app, ("Films", "Film"), poster, caption)
+
+                    quality = (
+                        ((r.get("quality") or {}).get("quality") or {}).get("name")
+                        or "Qualité inconnue"
+                    )
+
+                    caption = (
+                        "✅ <b>Film ajouté à Jellyfin</b>\n\n"
+                        f"🎬 <b>{html.escape(title)}</b>\n"
+                        f"🎞️ {html.escape(quality)}\n\n"
+                        "▶️ Le film est maintenant disponible."
+                    )
+
+                    sent = await send_photo_to_topic(
+                        app, ("Films", "Film"), poster, caption
+                    )
                     if not sent:
                         await send_to_topic(app, ("Films", "Film"), caption)
+
                     try:
                         await notify_private_requests(
-                            app, "movie", movie,
-                            poster=poster
+                            app, "movie", movie, poster=poster
                         )
                     except Exception:
                         log.exception("Erreur notification privée film")
 
+                # 4) Épisode téléchargé/importé par Sonarr = disponible dans Jellyfin
                 for r in reversed(sonarr):
                     if str(r.get("id")) in sseen:
                         continue
+
                     series_id = r.get("seriesId")
                     title = f"Série #{series_id}"
                     poster = ""
                     show = {"title": title}
+
                     try:
-                        show = await api_get(SONARR_URL, f"/api/v3/series/{series_id}", SONARR_API_KEY)
+                        show = await api_get(
+                            SONARR_URL,
+                            f"/api/v3/series/{series_id}",
+                            SONARR_API_KEY,
+                        )
                         title = show.get("title", title)
                         poster = arr_poster(show)
                     except Exception:
                         pass
+
                     source = (r.get("data") or {}).get("sourceTitle") or "Nouvel épisode"
-                    quality = (((r.get("quality") or {}).get("quality") or {}).get("name") or "Qualité inconnue")
-                    caption = f"📺 <b>Nouvel épisode disponible !</b>\n\n<b>{title}</b>\n{source}\n🎞️ {quality}\n\n▶️ Disponible prochainement dans Jellyfin."
-                    sent = await send_photo_to_topic(app, ("Série", "Séries", "Serie", "Series"), poster, caption)
+                    quality = (
+                        ((r.get("quality") or {}).get("quality") or {}).get("name")
+                        or "Qualité inconnue"
+                    )
+
+                    caption = (
+                        "✅ <b>Série ajoutée à Jellyfin</b>\n\n"
+                        f"📺 <b>{html.escape(title)}</b>\n"
+                        f"📦 {html.escape(source)}\n"
+                        f"🎞️ {html.escape(quality)}\n\n"
+                        "▶️ L'épisode est maintenant disponible."
+                    )
+
+                    sent = await send_photo_to_topic(
+                        app, ("Série", "Séries", "Serie", "Series"), poster, caption
+                    )
                     if not sent:
-                        await send_to_topic(app, ("Série", "Séries", "Serie", "Series"), caption)
+                        await send_to_topic(
+                            app, ("Série", "Séries", "Serie", "Series"), caption
+                        )
+
                     try:
                         await notify_private_requests(
-                            app, "tv", show,
+                            app,
+                            "tv",
+                            show,
                             poster=poster,
-                            extra=source
+                            extra=source,
                         )
                     except Exception:
                         log.exception("Erreur notification privée série")
 
-                state["radarr_seen"] = rid[:100]
-                state["sonarr_seen"] = sid[:150]
+                # Mise à jour des états après traitement
+                state["radarr_seen"] = list(dict.fromkeys(rid + state.get("radarr_seen", [])))[:500]
+                state["sonarr_seen"] = list(dict.fromkeys(sid + state.get("sonarr_seen", [])))[:500]
+                state["radarr_library_seen"] = movie_ids
+                state["sonarr_library_seen"] = series_ids
                 save_json(STATE_FILE, state)
 
         except Exception:
-            log.exception("Erreur monitoring")
+            log.exception("Erreur monitor_imports")
+
         await asyncio.sleep(POLL_SECONDS)
-
-
-async def passive_topic_capture(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await remember_topic(update)
 
 
 async def post_init(app: Application):
@@ -1297,7 +1406,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, remove_member_on_leave), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_request), group=0)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, passive_topic_capture), group=1)
-    log.info("Démarrage Telegram Media Bot v7.1")
+    log.info("Démarrage Telegram Media Bot v7.2")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
