@@ -1303,11 +1303,26 @@ async def monitor_imports(app: Application):
                         f"🎬 <b>{html.escape(title)}</b>\n"
                         "Radarr recherche maintenant le film."
                     )
-                    sent = await send_photo_to_topic(
-                        app, ("Films", "Film"), poster, caption
-                    )
-                    if not sent:
-                        await send_to_topic(app, ("Films", "Film"), caption)
+                    # Toujours publier la disponibilité dans le topic Films (103).
+                    try:
+                        if poster:
+                            await app.bot.send_photo(
+                                chat_id=int(TELEGRAM_CHAT_ID),
+                                message_thread_id=103,
+                                photo=poster,
+                                caption=caption,
+                                parse_mode=ParseMode.HTML,
+                            )
+                        else:
+                            await app.bot.send_message(
+                                chat_id=int(TELEGRAM_CHAT_ID),
+                                message_thread_id=103,
+                                text=caption,
+                                parse_mode=ParseMode.HTML,
+                                disable_web_page_preview=True,
+                            )
+                    except Exception:
+                        log.exception("Impossible d'envoyer la disponibilité du film dans le topic Films (103)")
 
                 # 2) Nouvelle série ajoutée à Sonarr = recherche en cours
                 for show in sonarr_library:
@@ -1322,13 +1337,26 @@ async def monitor_imports(app: Application):
                         f"📺 <b>{html.escape(title)}</b>\n"
                         "Sonarr recherche maintenant les épisodes demandés."
                     )
-                    sent = await send_photo_to_topic(
-                        app, ("Série", "Séries", "Serie", "Series"), poster, caption
-                    )
-                    if not sent:
-                        await send_to_topic(
-                            app, ("Série", "Séries", "Serie", "Series"), caption
-                        )
+                    # Toujours publier la disponibilité dans le topic Séries (104).
+                    try:
+                        if poster:
+                            await app.bot.send_photo(
+                                chat_id=int(TELEGRAM_CHAT_ID),
+                                message_thread_id=104,
+                                photo=poster,
+                                caption=caption,
+                                parse_mode=ParseMode.HTML,
+                            )
+                        else:
+                            await app.bot.send_message(
+                                chat_id=int(TELEGRAM_CHAT_ID),
+                                message_thread_id=104,
+                                text=caption,
+                                parse_mode=ParseMode.HTML,
+                                disable_web_page_preview=True,
+                            )
+                    except Exception:
+                        log.exception("Impossible d'envoyer la disponibilité de la série dans le topic Séries (104)")
 
                 # 3) Film téléchargé/importé par Radarr = disponible dans Jellyfin
                 for r in reversed(radarr):
@@ -1369,12 +1397,8 @@ async def monitor_imports(app: Application):
                     if not sent:
                         await send_to_topic(app, ("Films", "Film"), caption)
 
-                    try:
-                        await notify_private_requests(
-                            app, "movie", movie, poster=poster
-                        )
-                    except Exception:
-                        log.exception("Erreur notification privée film")
+                    # Notification disponibilité uniquement dans le topic Films.
+                    log.info("Notification film envoyée dans le topic Films (103): %s", title)
 
                 # 4) Épisode téléchargé/importé par Sonarr = disponible dans Jellyfin
                 for r in reversed(sonarr):
@@ -1419,16 +1443,8 @@ async def monitor_imports(app: Application):
                             app, ("Série", "Séries", "Serie", "Series"), caption
                         )
 
-                    try:
-                        await notify_private_requests(
-                            app,
-                            "tv",
-                            show,
-                            poster=poster,
-                            extra=source,
-                        )
-                    except Exception:
-                        log.exception("Erreur notification privée série")
+                    # Notification disponibilité uniquement dans le topic Séries.
+                    log.info("Notification série envoyée dans le topic Séries (104): %s", title)
 
                 # Mise à jour des états après traitement
                 state["radarr_seen"] = list(dict.fromkeys(rid + state.get("radarr_seen", [])))[:500]
@@ -1466,7 +1482,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members), group=-1)
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, remove_member_on_leave), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_request), group=0)
-    log.info("Démarrage Telegram Media Bot v7.7")
+    log.info("Démarrage Telegram Media Bot v7.8")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
