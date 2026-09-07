@@ -742,6 +742,37 @@ async def topicid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(f"✅ {name} = {msg.message_thread_id}")
 
 
+async def deltopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin_user_id(user.id):
+        return await deny(update)
+
+    if not context.args:
+        return await update.effective_message.reply_text(
+            "Utilisation : /deltopic ID\\nExemple : /deltopic 82"
+        )
+
+    try:
+        topic_id = int(context.args[0])
+    except ValueError:
+        return await update.effective_message.reply_text("❌ ID de topic invalide.")
+
+    key = str(topic_id)
+    if key not in topics:
+        return await update.effective_message.reply_text(
+            f"⚠️ Le topic {topic_id} n'est pas mémorisé."
+        )
+
+    old_name = topics.get(key, {}).get("name", f"Topic {topic_id}")
+    topics.pop(key, None)
+    save_json(TOPICS_FILE, topics)
+
+    await update.effective_message.reply_text(
+        f"🗑️ {old_name} ({topic_id}) supprimé de la mémoire du bot.\\n"
+        "Le topic Telegram lui-même n'est pas supprimé."
+    )
+
+
 async def topics_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return await deny(update)
@@ -1257,6 +1288,7 @@ def main():
     app.add_handler(CommandHandler("setup", setup))
     app.add_handler(CommandHandler("topicid", topicid))
     app.add_handler(CommandHandler("topics", topics_cmd))
+    app.add_handler(CommandHandler("deltopic", deltopic))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("film", film))
     app.add_handler(CommandHandler("serie", serie))
@@ -1265,7 +1297,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, remove_member_on_leave), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_request), group=0)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, passive_topic_capture), group=1)
-    log.info("Démarrage Telegram Media Bot v7")
+    log.info("Démarrage Telegram Media Bot v7.1")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
