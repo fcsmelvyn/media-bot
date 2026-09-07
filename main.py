@@ -1225,11 +1225,25 @@ async def monitor_service_health(app: Application):
             current = "down"
             log.warning("SERVICE DOWN détecté: %s (%s)", name, exc)
         previous = statuses.get(name)
-        if previous is not None and previous != current:
-            if current == "down":
-                await send_to_topic(app, ("Annonces",), f"🚨 <b>{html.escape(name)} est DOWN</b>\nLe service ne répond plus.")
-            else:
-                await send_to_topic(app, ("Annonces",), f"✅ <b>{html.escape(name)} est de nouveau en ligne.</b>")
+
+        # Si un service est déjà DOWN au premier contrôle après un redémarrage
+        # du bot, on prévient quand même. Avant, previous=None empêchait l'alerte.
+        if current == "down" and previous != "down":
+            await send_to_topic(
+                app,
+                ("Annonces",),
+                f"🚨 <b>{html.escape(name)} est DOWN</b>\nLe service ne répond plus."
+            )
+            log.warning("ALERTE Telegram DOWN envoyée pour %s (ancien état=%s)", name, previous)
+
+        elif current == "up" and previous == "down":
+            await send_to_topic(
+                app,
+                ("Annonces",),
+                f"✅ <b>{html.escape(name)} est de nouveau en ligne.</b>"
+            )
+            log.info("ALERTE Telegram UP envoyée pour %s", name)
+
         statuses[name] = current
     save_json(STATE_FILE, state)
 
@@ -1452,7 +1466,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_members), group=-1)
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, remove_member_on_leave), group=-1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, natural_request), group=0)
-    log.info("Démarrage Telegram Media Bot v7.6")
+    log.info("Démarrage Telegram Media Bot v7.7")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
